@@ -1,0 +1,43 @@
+# AnchorSwap – Soroban contract manifest
+# Used by `soroban contract build` and `soroban contract deploy` tooling.
+# See: https://developers.stellar.org/docs/smart-contracts/getting-started/setup
+
+[contract]
+name     = "AnchorSwap AMM"
+version  = "0.1.0"
+
+# Path to the compiled WASM artefact (relative to this file).
+# `soroban contract build` emits to target/wasm32-unknown-unknown/release/.
+wasm = "../../target/wasm32-unknown-unknown/release/anchorswap.wasm"
+
+# Soroban SDK version used. Must match [dependencies] in Cargo.toml.
+sdk_version = "20.3.2"
+
+# Human-readable description for contract explorers.
+description = """
+Permissionless constant-product AMM on Stellar/Soroban.
+Supports token pair creation, liquidity provision, and 0.3 % fee swaps.
+"""
+
+# Authors shown in contract metadata.
+authors = ["AnchorSwap Contributors"]
+
+# Apache-2.0 SPDX identifier.
+license = "Apache-2.0"
+
+# Repository for source-code verification.
+repository = "https://github.com/your-org/anchorswap"
+
+# ── Network targets ────────────────────────────────────────────────────────────
+# These sections are read by `scripts/deploy_testnet.sh` and any CI/CD that
+# calls `soroban contract deploy --network`.
+
+[network.testnet]
+rpc_url         = "https://soroban-testnet.stellar.org"
+network_passphrase = "Test SDF Network ; September 2015"
+friendbot_url   = "https://friendbot.stellar.org"
+
+[network.mainnet]
+rpc_url            = "https://soroban-mainnet.stellar.org"
+network_passphrase = "Public Global Stellar Network ; September 2015"
+# No friendbot on mainnet.

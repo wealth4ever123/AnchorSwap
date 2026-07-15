@@ -1,0 +1,19 @@
+[package]
+name = "soroban-token-contract"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[features]
+default = []
+testutils = ["soroban-sdk/testutils", "dep:soroban-token-sdk"]
+
+[dependencies]
+soroban-sdk = { version = "20.3.2" }
+soroban-token-sdk = { version = "20.3.2", optional = true }
+
+[dev-dependencies]
+soroban-sdk = { version = "20.3.2", features = ["testutils"] }
+soroban-token-sdk = { version = "20.3.2" }

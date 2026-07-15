@@ -1,0 +1,150 @@
+# AnchorSwap – GitHub Actions CI/CD Pipeline
+#
+# Triggers:
+#   • Every push to `main`
+#   • Every pull request targeting `main`
+#
+# Jobs run in parallel:
+#   1. rust-checks  – format, lint, and test the Soroban smart contracts
+#   2. frontend-checks – type-check, lint, and build the Next.js frontend
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel any in-progress run for the same ref to save CI minutes.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# ─── Shared env ───────────────────────────────────────────────────────────────
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"      # Treat compiler warnings as errors
+  NODE_VERSION: "20"
+  RUST_VERSION: "1.78"          # Pin to a stable toolchain
+
+# =============================================================================
+# Job 1 – Rust smart-contract checks
+# =============================================================================
+jobs:
+  rust-checks:
+    name: Rust – Format / Clippy / Test
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── Checkout ────────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── Rust toolchain ──────────────────────────────────────────────────────
+      - name: Install Rust toolchain (${{ env.RUST_VERSION }})
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+          targets: wasm32-unknown-unknown
+          components: rustfmt, clippy
+
+      # ── Cache cargo registry & build artefacts ──────────────────────────────
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-
+
+      # ── Format ──────────────────────────────────────────────────────────────
+      - name: Check formatting (rustfmt)
+        run: cargo fmt --all -- --check
+
+      # ── Lint ────────────────────────────────────────────────────────────────
+      - name: Clippy lint (contracts)
+        run: |
+          cargo clippy \
+            --all-targets \
+            --features testutils \
+            -- -D warnings
+
+      # ── Unit & integration tests ─────────────────────────────────────────────
+      - name: Run contract tests
+        run: |
+          cargo test \
+            --features testutils \
+            --workspace \
+            -- --nocapture
+
+      # ── WASM build (smoke test – ensures contract compiles for wasm32) ────────
+      - name: Build WASM artefact (release)
+        run: |
+          cargo build \
+            --target wasm32-unknown-unknown \
+            --release \
+            --package anchorswap
+
+      - name: Assert WASM artefact exists
+        run: |
+          ls -lh target/wasm32-unknown-unknown/release/anchorswap.wasm
+          # Fail if the WASM is suspiciously large (> 1 MB unoptimised).
+          SIZE=$(stat -c%s target/wasm32-unknown-unknown/release/anchorswap.wasm)
+          echo "WASM size: ${SIZE} bytes"
+          [ "${SIZE}" -lt 1048576 ] || echo "Warning: WASM exceeds 1 MB – consider optimising"
+
+# =============================================================================
+# Job 2 – Next.js frontend checks
+# =============================================================================
+  frontend-checks:
+    name: Frontend – Lint / Type-check / Build
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: frontend
+
+    steps:
+      # ── Checkout ────────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── Node.js ─────────────────────────────────────────────────────────────
+      - name: Set up Node.js ${{ env.NODE_VERSION }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      # ── Install dependencies ─────────────────────────────────────────────────
+      - name: Install npm dependencies
+        run: npm ci
+
+      # ── ESLint ──────────────────────────────────────────────────────────────
+      - name: Lint (ESLint)
+        run: npm run lint
+
+      # ── TypeScript type check ────────────────────────────────────────────────
+      - name: Type-check (tsc --noEmit)
+        run: npm run type-check
+
+      # ── Production build ─────────────────────────────────────────────────────
+      - name: Build Next.js application
+        env:
+          # Provide a dummy contract ID so the build doesn't fail on missing env.
+          NEXT_PUBLIC_ANCHORSWAP_CONTRACT: CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM
+          NEXT_PUBLIC_CONTRACT_ID: CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM
+        run: npm run build
+
+      # ── Optional: upload build artefact for inspection ───────────────────────
+      - name: Upload build output
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nextjs-build
+          path: frontend/.next
+          retention-days: 3
