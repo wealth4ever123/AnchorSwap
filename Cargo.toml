@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
-members = [
-    "contracts/anchorswap",
-    "contracts/token",
-]
+members = ["contracts/anchorswap"]
+
+[workspace.dependencies]
+soroban-sdk = "29.0.1"
 
 [profile.release]
 opt-level = "z"
@@ -12,8 +12,8 @@ debug = 0
 strip = "symbols"
 debug-assertions = false
 panic = "abort"
-lto = true
 codegen-units = 1
+lto = true
 
 [profile.release-with-logs]
 inherits = "release"

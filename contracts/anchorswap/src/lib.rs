@@ -1,560 +1,449 @@
-//! AnchorSwap – Constant-Product AMM on Stellar / Soroban
+//! AnchorSwap: a constant-product (x·y=k) AMM for Stellar / Soroban.
 //!
-//! ## Design summary
-//! * Pairs are identified by a *canonical key*: `(min_addr, max_addr)` where
-//!   the order is determined by XDR byte-encoding of each `Address`.
-//! * Shares represent proportional ownership of a pool's reserves.
-//! * A 0.3 % swap fee accrues in the pool, benefiting all LPs.
-//! * A simple boolean re-entrancy guard prevents re-entrant calls on all
-//!   state-mutating entry points.
-//! * All arithmetic is checked; overflows cause an explicit panic message.
+//! * One contract holds many pools. A pool is identified by its two token
+//!   addresses in canonical (sorted) order.
+//! * 0.30 % swap fee, kept in the pool for liquidity providers.
+//! * Pools are created by the admin only, so the UI never lists a pool
+//!   built on a malicious token contract.
+//! * The admin can pause swaps and deposits. Withdrawals always work, so
+//!   users can exit even while paused.
+//! * Every state-changing call takes a `deadline` (ledger timestamp) and a
+//!   minimum output, so a delayed or front-run transaction fails instead of
+//!   executing at a bad price.
+//! * Soroban forbids a contract from being re-entered while it is on the
+//!   call stack, so no manual re-entrancy lock is needed.
 
 #![no_std]
 
+mod error;
+mod math;
+mod storage;
+
+#[cfg(test)]
+mod test;
+
 use soroban_sdk::{
-    contract, contractimpl, contracttype, symbol_short, token, xdr::ToXdr, Address, Bytes,
-    BytesN, Env,
+    contract, contractevent, contractimpl, token, Address, BytesN, ContractExecutable, Env, Vec,
 };
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Types
-// ──────────────────────────────────────────────────────────────────────────────
+pub use error::Error;
+pub use math::{FEE_BPS, MINIMUM_LIQUIDITY};
+pub use storage::{PairKey, PairState};
 
-/// Canonical pair identifier. Both addresses are stored in lexicographic
-/// order of their XDR encoding so that `(A, B)` and `(B, A)` map to the
-/// same key.
-pub type PairKey = (Address, Address);
+// ── Events ───────────────────────────────────────────────────────────────────
 
-/// All persistent/instance storage keys used by the contract.
-#[contracttype]
-#[derive(Clone)]
-pub enum StorageKey {
-    /// The contract administrator – may call `upgrade`.
-    Admin,
-    /// Global re-entrancy lock.
-    Locked,
-    /// Reserve of the *first* token in the canonical pair.
-    ReserveA(PairKey),
-    /// Reserve of the *second* token in the canonical pair.
-    ReserveB(PairKey),
-    /// Total LP-share supply for a pair.
-    TotalShares(PairKey),
-    /// LP-share balance of an individual provider for a pair.
-    ShareBalance(PairKey, Address),
+#[contractevent]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PairCreated {
+    #[topic]
+    pub token_a: Address,
+    #[topic]
+    pub token_b: Address,
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Math helpers
-// ──────────────────────────────────────────────────────────────────────────────
-
-/// Integer square-root via Newton's method (floor).
-///
-/// Returns `0` for `n <= 0`.
-pub fn isqrt(n: i128) -> i128 {
-    if n <= 0 {
-        return 0;
-    }
-    let mut x = n;
-    let mut y = (x + 1) / 2;
-    while y < x {
-        x = y;
-        y = (x + n / x) / 2;
-    }
-    x
+#[contractevent]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LiquidityAdded {
+    #[topic]
+    pub provider: Address,
+    pub token_a: Address,
+    pub token_b: Address,
+    pub amount_a: i128,
+    pub amount_b: i128,
+    pub shares: i128,
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Canonical pair ordering
-// ──────────────────────────────────────────────────────────────────────────────
+#[contractevent]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LiquidityRemoved {
+    #[topic]
+    pub provider: Address,
+    pub token_a: Address,
+    pub token_b: Address,
+    pub amount_a: i128,
+    pub amount_b: i128,
+    pub shares: i128,
+}
 
-/// Return addresses in a stable canonical order by comparing their XDR
-/// byte-level encoding. This guarantees that regardless of the call order,
-/// the storage key is always the same.
-fn canonical_pair(e: &Env, a: Address, b: Address) -> PairKey {
-    let bytes_a: Bytes = a.clone().to_xdr(e);
-    let bytes_b: Bytes = b.clone().to_xdr(e);
-    if bytes_a <= bytes_b {
-        (a, b)
+#[contractevent]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Swap {
+    #[topic]
+    pub user: Address,
+    pub token_in: Address,
+    pub token_out: Address,
+    pub amount_in: i128,
+    pub amount_out: i128,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PausedChanged {
+    pub paused: bool,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdminChanged {
+    pub admin: Address,
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+fn check_deadline(e: &Env, deadline: u64) -> Result<(), Error> {
+    if e.ledger().timestamp() > deadline {
+        return Err(Error::DeadlineExpired);
+    }
+    Ok(())
+}
+
+fn check_not_paused(e: &Env) -> Result<(), Error> {
+    if storage::is_paused(e) {
+        return Err(Error::Paused);
+    }
+    Ok(())
+}
+
+fn load_pair(e: &Env, x: &Address, y: &Address) -> Result<(PairKey, bool, PairState), Error> {
+    if x == y {
+        return Err(Error::IdenticalTokens);
+    }
+    let (key, in_order) = storage::canonical(e, x, y);
+    let state = storage::get_pair(e, &key).ok_or(Error::PairNotFound)?;
+    Ok((key, in_order, state))
+}
+
+/// Swap a pair of values between caller order and canonical order.
+fn order<T>(in_order: bool, first: T, second: T) -> (T, T) {
+    if in_order {
+        (first, second)
     } else {
-        (b, a)
+        (second, first)
     }
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Storage helpers
-// ──────────────────────────────────────────────────────────────────────────────
-
-fn get_reserve_a(e: &Env, key: &PairKey) -> i128 {
-    e.storage()
-        .instance()
-        .get(&StorageKey::ReserveA(key.clone()))
-        .unwrap_or(0_i128)
-}
-
-fn get_reserve_b(e: &Env, key: &PairKey) -> i128 {
-    e.storage()
-        .instance()
-        .get(&StorageKey::ReserveB(key.clone()))
-        .unwrap_or(0_i128)
-}
-
-fn set_reserve_a(e: &Env, key: &PairKey, val: i128) {
-    e.storage()
-        .instance()
-        .set(&StorageKey::ReserveA(key.clone()), &val);
-}
-
-fn set_reserve_b(e: &Env, key: &PairKey, val: i128) {
-    e.storage()
-        .instance()
-        .set(&StorageKey::ReserveB(key.clone()), &val);
-}
-
-fn get_total_shares(e: &Env, key: &PairKey) -> i128 {
-    e.storage()
-        .instance()
-        .get(&StorageKey::TotalShares(key.clone()))
-        .unwrap_or(0_i128)
-}
-
-fn set_total_shares(e: &Env, key: &PairKey, val: i128) {
-    e.storage()
-        .instance()
-        .set(&StorageKey::TotalShares(key.clone()), &val);
-}
-
-fn get_share_balance(e: &Env, key: &PairKey, user: &Address) -> i128 {
-    e.storage()
-        .persistent()
-        .get(&StorageKey::ShareBalance(key.clone(), user.clone()))
-        .unwrap_or(0_i128)
-}
-
-fn set_share_balance(e: &Env, key: &PairKey, user: &Address, val: i128) {
-    e.storage()
-        .persistent()
-        .set(&StorageKey::ShareBalance(key.clone(), user.clone()), &val);
-}
-
-fn pair_exists(e: &Env, key: &PairKey) -> bool {
-    // A pair is considered initialised once TotalShares key is present
-    // (set to 0 on init_pair).
-    e.storage()
-        .instance()
-        .has(&StorageKey::TotalShares(key.clone()))
-}
-
-fn require_not_locked(e: &Env) {
-    if e.storage()
-        .instance()
-        .get::<StorageKey, bool>(&StorageKey::Locked)
-        .unwrap_or(false)
-    {
-        panic!("anchorswap: re-entrant call");
-    }
-}
-
-fn lock(e: &Env) {
-    e.storage().instance().set(&StorageKey::Locked, &true);
-}
-
-fn unlock(e: &Env) {
-    e.storage().instance().set(&StorageKey::Locked, &false);
-}
-
-fn require_admin(e: &Env) {
-    let admin: Address = e
-        .storage()
-        .instance()
-        .get(&StorageKey::Admin)
-        .expect("anchorswap: not initialized");
-    admin.require_auth();
-}
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Contract
-// ──────────────────────────────────────────────────────────────────────────────
+// ── Contract ─────────────────────────────────────────────────────────────────
 
 #[contract]
 pub struct AnchorSwap;
 
 #[contractimpl]
 impl AnchorSwap {
-    // ── Initialization ────────────────────────────────────────────────────────
+    /// Runs once, atomically with deployment, so nobody can front-run
+    /// initialisation and take over the admin role.
+    pub fn __constructor(e: Env, admin: Address) {
+        storage::set_admin(&e, &admin);
+        storage::bump_instance(&e);
+    }
 
-    /// One-time contract initialization. Sets the admin address.
-    pub fn initialize(e: Env, admin: Address) {
-        if e.storage().instance().has(&StorageKey::Admin) {
-            panic!("anchorswap: already initialized");
+    // ── Admin ────────────────────────────────────────────────────────────────
+
+    /// Register a new pool. Admin only.
+    pub fn create_pair(e: Env, token_a: Address, token_b: Address) -> Result<PairKey, Error> {
+        storage::get_admin(&e).require_auth();
+        storage::bump_instance(&e);
+        if token_a == token_b {
+            return Err(Error::IdenticalTokens);
         }
-        e.storage().instance().set(&StorageKey::Admin, &admin);
+        let (key, _) = storage::canonical(&e, &token_a, &token_b);
+        if storage::get_pair(&e, &key).is_some() {
+            return Err(Error::PairAlreadyExists);
+        }
+        let mut pairs = storage::get_pairs(&e);
+        if pairs.len() >= storage::MAX_PAIRS {
+            return Err(Error::TooManyPairs);
+        }
+        // Calling `decimals()` fails for addresses that are not token
+        // contracts, so a typo cannot create a dead pool.
+        token::TokenClient::new(&e, &key.token_a).decimals();
+        token::TokenClient::new(&e, &key.token_b).decimals();
+
+        storage::set_pair(
+            &e,
+            &key,
+            &PairState {
+                reserve_a: 0,
+                reserve_b: 0,
+                total_shares: 0,
+            },
+        );
+        pairs.push_back(key.clone());
+        storage::set_pairs(&e, &pairs);
+
+        PairCreated {
+            token_a: key.token_a.clone(),
+            token_b: key.token_b.clone(),
+        }
+        .publish(&e);
+        Ok(key)
     }
 
-    // ── Pair creation ─────────────────────────────────────────────────────────
-
-    /// Create a new liquidity pair for `token_a` / `token_b`.
-    ///
-    /// The addresses are reordered into canonical form internally; calling
-    /// with `(A, B)` or `(B, A)` both refer to the same pair.
-    /// Panics if the pair already exists.
-    pub fn init_pair(e: Env, token_a: Address, token_b: Address) {
-        assert!(
-            token_a != token_b,
-            "anchorswap: identical token addresses"
-        );
-        let key = canonical_pair(&e, token_a.clone(), token_b.clone());
-        assert!(!pair_exists(&e, &key), "anchorswap: pair already exists");
-
-        // Mark pair as existing by writing TotalShares = 0.
-        set_total_shares(&e, &key, 0);
-        set_reserve_a(&e, &key, 0);
-        set_reserve_b(&e, &key, 0);
-
-        e.events().publish(
-            (symbol_short!("PairCrtd"),),
-            (key.0.clone(), key.1.clone()),
-        );
+    /// Pause or resume swaps and deposits. Admin only.
+    pub fn set_paused(e: Env, paused: bool) {
+        storage::get_admin(&e).require_auth();
+        storage::bump_instance(&e);
+        storage::set_paused(&e, paused);
+        PausedChanged { paused }.publish(&e);
     }
 
-    // ── Add liquidity ─────────────────────────────────────────────────────────
+    /// Hand the admin role to `new_admin`. Both the current and the new admin
+    /// must sign, so the role cannot be sent to a mistyped address.
+    pub fn set_admin(e: Env, new_admin: Address) {
+        storage::get_admin(&e).require_auth();
+        new_admin.require_auth();
+        storage::bump_instance(&e);
+        storage::set_admin(&e, &new_admin);
+        AdminChanged { admin: new_admin }.publish(&e);
+    }
 
-    /// Deposit tokens into a pool and receive LP shares.
-    ///
-    /// First deposit: shares = isqrt(amount_a * amount_b).
-    /// Subsequent deposits: shares = min(amount_a * total / ra, amount_b * total / rb).
-    ///
-    /// Returns `(shares_minted, actual_amount_a, actual_amount_b)`.
+    /// Replace the contract code. Admin only.
+    pub fn upgrade(e: Env, new_wasm_hash: BytesN<32>) {
+        storage::get_admin(&e).require_auth();
+        e.deployer()
+            .update_current_contract(ContractExecutable::Wasm(new_wasm_hash));
+    }
+
+    // ── Liquidity ────────────────────────────────────────────────────────────
+
+    /// Deposit up to `amount_a_desired` / `amount_b_desired` and receive LP
+    /// shares. Only the amounts that match the pool's current ratio are
+    /// taken. Returns `(amount_a, amount_b, shares)` in the caller's order.
+    #[allow(clippy::too_many_arguments)]
     pub fn add_liquidity(
         e: Env,
+        provider: Address,
         token_a: Address,
         token_b: Address,
         amount_a_desired: i128,
         amount_b_desired: i128,
-        min_share: i128,
-        provider: Address,
-    ) -> (i128, i128, i128) {
+        amount_a_min: i128,
+        amount_b_min: i128,
+        deadline: u64,
+    ) -> Result<(i128, i128, i128), Error> {
         provider.require_auth();
-        require_not_locked(&e);
-        lock(&e);
+        storage::bump_instance(&e);
+        check_deadline(&e, deadline)?;
+        check_not_paused(&e)?;
+        let (key, in_order, mut state) = load_pair(&e, &token_a, &token_b)?;
 
-        assert!(amount_a_desired > 0, "anchorswap: amount_a must be > 0");
-        assert!(amount_b_desired > 0, "anchorswap: amount_b must be > 0");
+        let (a_des, b_des) = order(in_order, amount_a_desired, amount_b_desired);
+        let (a_min, b_min) = order(in_order, amount_a_min, amount_b_min);
+        let d = math::deposit(
+            a_des,
+            b_des,
+            a_min,
+            b_min,
+            state.reserve_a,
+            state.reserve_b,
+            state.total_shares,
+        )?;
 
-        let key = canonical_pair(&e, token_a.clone(), token_b.clone());
-        assert!(pair_exists(&e, &key), "anchorswap: pair does not exist");
+        let this = e.current_contract_address();
+        token::TokenClient::new(&e, &key.token_a).transfer(&provider, &this, &d.amount_a);
+        token::TokenClient::new(&e, &key.token_b).transfer(&provider, &this, &d.amount_b);
 
-        let ra = get_reserve_a(&e, &key);
-        let rb = get_reserve_b(&e, &key);
-        let total = get_total_shares(&e, &key);
+        state.reserve_a = state
+            .reserve_a
+            .checked_add(d.amount_a)
+            .ok_or(Error::Overflow)?;
+        state.reserve_b = state
+            .reserve_b
+            .checked_add(d.amount_b)
+            .ok_or(Error::Overflow)?;
+        state.total_shares = state
+            .total_shares
+            .checked_add(d.shares + d.locked)
+            .ok_or(Error::Overflow)?;
+        storage::set_pair(&e, &key, &state);
 
-        // Map caller-supplied amounts to canonical (a, b) order.
-        let bytes_a: Bytes = token_a.clone().to_xdr(&e);
-        let bytes_b: Bytes = token_b.clone().to_xdr(&e);
-        let (amount_a, amount_b) = if bytes_a <= bytes_b {
-            (amount_a_desired, amount_b_desired)
-        } else {
-            (amount_b_desired, amount_a_desired)
-        };
-
-        // Calculate shares.
-        let shares = if total == 0 {
-            // First LP: geometric mean
-            let product = amount_a
-                .checked_mul(amount_b)
-                .expect("anchorswap: overflow computing initial shares");
-            let s = isqrt(product);
-            assert!(s > 0, "anchorswap: initial share amount is zero");
-            s
-        } else {
-            // Proportional to existing reserves
-            let s_a = amount_a
-                .checked_mul(total)
-                .expect("anchorswap: overflow s_a numerator")
-                / ra;
-            let s_b = amount_b
-                .checked_mul(total)
-                .expect("anchorswap: overflow s_b numerator")
-                / rb;
-            s_a.min(s_b)
-        };
-
-        assert!(shares >= min_share, "anchorswap: insufficient shares minted");
-
-        // Transfer tokens from provider to contract.
-        let contract_addr = e.current_contract_address();
-        token::Client::new(&e, &key.0).transfer(&provider, &contract_addr, &amount_a);
-        token::Client::new(&e, &key.1).transfer(&provider, &contract_addr, &amount_b);
-
-        // Update reserves and share balances.
-        let new_ra = ra
-            .checked_add(amount_a)
-            .expect("anchorswap: reserve_a overflow");
-        let new_rb = rb
-            .checked_add(amount_b)
-            .expect("anchorswap: reserve_b overflow");
-        set_reserve_a(&e, &key, new_ra);
-        set_reserve_b(&e, &key, new_rb);
-
-        let new_total = total
-            .checked_add(shares)
-            .expect("anchorswap: total shares overflow");
-        set_total_shares(&e, &key, new_total);
-
-        let prev_share = get_share_balance(&e, &key, &provider);
-        let new_share = prev_share
-            .checked_add(shares)
-            .expect("anchorswap: share balance overflow");
-        set_share_balance(&e, &key, &provider, new_share);
-
-        e.events().publish(
-            (symbol_short!("LiqAdded"),),
-            (
-                key.0.clone(),
-                key.1.clone(),
-                amount_a,
-                amount_b,
-                shares,
-                provider.clone(),
-            ),
+        let held = storage::get_shares(&e, &key, &provider);
+        storage::set_shares(
+            &e,
+            &key,
+            &provider,
+            held.checked_add(d.shares).ok_or(Error::Overflow)?,
         );
 
-        unlock(&e);
-        (shares, new_ra, new_rb)
+        LiquidityAdded {
+            provider,
+            token_a: key.token_a,
+            token_b: key.token_b,
+            amount_a: d.amount_a,
+            amount_b: d.amount_b,
+            shares: d.shares,
+        }
+        .publish(&e);
+
+        let (out_a, out_b) = order(in_order, d.amount_a, d.amount_b);
+        Ok((out_a, out_b, d.shares))
     }
 
-    // ── Remove liquidity ──────────────────────────────────────────────────────
-
-    /// Burn LP shares and withdraw proportional tokens from the pool.
-    ///
-    /// Returns `(amount_a_out, amount_b_out)` in canonical token order.
+    /// Burn `shares` and withdraw the matching part of both reserves.
+    /// Works even while paused. Returns `(amount_a, amount_b)` in the
+    /// caller's order.
+    #[allow(clippy::too_many_arguments)]
     pub fn remove_liquidity(
         e: Env,
+        provider: Address,
         token_a: Address,
         token_b: Address,
-        share_amount: i128,
-        min_a: i128,
-        min_b: i128,
-        provider: Address,
-    ) -> (i128, i128) {
+        shares: i128,
+        amount_a_min: i128,
+        amount_b_min: i128,
+        deadline: u64,
+    ) -> Result<(i128, i128), Error> {
         provider.require_auth();
-        require_not_locked(&e);
-        lock(&e);
+        storage::bump_instance(&e);
+        check_deadline(&e, deadline)?;
+        let (key, in_order, mut state) = load_pair(&e, &token_a, &token_b)?;
 
-        assert!(share_amount > 0, "anchorswap: share_amount must be > 0");
+        let held = storage::get_shares(&e, &key, &provider);
+        if shares <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+        if shares > held {
+            return Err(Error::InsufficientShares);
+        }
+        let (amount_a, amount_b) =
+            math::withdraw(shares, state.reserve_a, state.reserve_b, state.total_shares)?;
 
-        let key = canonical_pair(&e, token_a.clone(), token_b.clone());
-        assert!(pair_exists(&e, &key), "anchorswap: pair does not exist");
+        let (a_min, b_min) = order(in_order, amount_a_min, amount_b_min);
+        if amount_a < a_min || amount_b < b_min {
+            return Err(Error::SlippageExceeded);
+        }
+        if amount_a == 0 && amount_b == 0 {
+            return Err(Error::InsufficientLiquidity);
+        }
 
-        let ra = get_reserve_a(&e, &key);
-        let rb = get_reserve_b(&e, &key);
-        let total = get_total_shares(&e, &key);
+        // Update state before the outgoing transfers.
+        storage::set_shares(&e, &key, &provider, held - shares);
+        state.total_shares -= shares;
+        state.reserve_a -= amount_a;
+        state.reserve_b -= amount_b;
+        storage::set_pair(&e, &key, &state);
 
-        assert!(total > 0, "anchorswap: empty pool");
+        let this = e.current_contract_address();
+        if amount_a > 0 {
+            token::TokenClient::new(&e, &key.token_a).transfer(&this, &provider, &amount_a);
+        }
+        if amount_b > 0 {
+            token::TokenClient::new(&e, &key.token_b).transfer(&this, &provider, &amount_b);
+        }
 
-        let user_shares = get_share_balance(&e, &key, &provider);
-        assert!(user_shares >= share_amount, "anchorswap: insufficient shares");
+        LiquidityRemoved {
+            provider,
+            token_a: key.token_a,
+            token_b: key.token_b,
+            amount_a,
+            amount_b,
+            shares,
+        }
+        .publish(&e);
 
-        // Proportional withdrawal.
-        let amount_a = share_amount
-            .checked_mul(ra)
-            .expect("anchorswap: overflow amount_a")
-            / total;
-        let amount_b = share_amount
-            .checked_mul(rb)
-            .expect("anchorswap: overflow amount_b")
-            / total;
-
-        // Map canonical amounts back to caller-supplied token order.
-        let bytes_a: Bytes = token_a.clone().to_xdr(&e);
-        let bytes_b: Bytes = token_b.clone().to_xdr(&e);
-        let (out_a_for_caller, out_b_for_caller) = if bytes_a <= bytes_b {
-            (amount_a, amount_b)
-        } else {
-            (amount_b, amount_a)
-        };
-
-        assert!(
-            out_a_for_caller >= min_a,
-            "anchorswap: amount_a below minimum"
-        );
-        assert!(
-            out_b_for_caller >= min_b,
-            "anchorswap: amount_b below minimum"
-        );
-
-        // Burn shares.
-        let new_user_shares = user_shares
-            .checked_sub(share_amount)
-            .expect("anchorswap: share underflow");
-        set_share_balance(&e, &key, &provider, new_user_shares);
-
-        let new_total = total
-            .checked_sub(share_amount)
-            .expect("anchorswap: total shares underflow");
-        set_total_shares(&e, &key, new_total);
-
-        // Update reserves.
-        let new_ra = ra
-            .checked_sub(amount_a)
-            .expect("anchorswap: reserve_a underflow");
-        let new_rb = rb
-            .checked_sub(amount_b)
-            .expect("anchorswap: reserve_b underflow");
-        set_reserve_a(&e, &key, new_ra);
-        set_reserve_b(&e, &key, new_rb);
-
-        // Transfer tokens back to the provider.
-        let contract_addr = e.current_contract_address();
-        token::Client::new(&e, &key.0).transfer(&contract_addr, &provider, &amount_a);
-        token::Client::new(&e, &key.1).transfer(&contract_addr, &provider, &amount_b);
-
-        e.events().publish(
-            (symbol_short!("LiqRmvd"),),
-            (
-                key.0.clone(),
-                key.1.clone(),
-                amount_a,
-                amount_b,
-                share_amount,
-                provider.clone(),
-            ),
-        );
-
-        unlock(&e);
-        (out_a_for_caller, out_b_for_caller)
+        Ok(order(in_order, amount_a, amount_b))
     }
 
-    // ── Swap ──────────────────────────────────────────────────────────────────
+    // ── Swap ─────────────────────────────────────────────────────────────────
 
-    /// Swap an exact amount of `token_in` for at least `min_out` of `token_out`.
-    ///
-    /// Fee: 0.3 % retained in the pool (standard Uniswap v2 formula).
-    ///
-    /// Returns the actual amount of `token_out` received.
+    /// Sell exactly `amount_in` of `token_in` for at least `min_out` of
+    /// `token_out`. Returns the amount received.
     pub fn swap_exact_in(
         e: Env,
+        user: Address,
         token_in: Address,
         token_out: Address,
         amount_in: i128,
         min_out: i128,
-        user: Address,
-    ) -> i128 {
+        deadline: u64,
+    ) -> Result<i128, Error> {
         user.require_auth();
-        require_not_locked(&e);
-        lock(&e);
+        storage::bump_instance(&e);
+        check_deadline(&e, deadline)?;
+        check_not_paused(&e)?;
+        if min_out < 0 {
+            return Err(Error::InvalidAmount);
+        }
+        let (key, in_is_a, mut state) = load_pair(&e, &token_in, &token_out)?;
 
-        assert!(amount_in > 0, "anchorswap: amount_in must be > 0");
+        let (reserve_in, reserve_out) = order(in_is_a, state.reserve_a, state.reserve_b);
+        let amount_out = math::amount_out(amount_in, reserve_in, reserve_out)?;
+        if amount_out == 0 {
+            return Err(Error::InsufficientLiquidity);
+        }
+        if amount_out < min_out {
+            return Err(Error::SlippageExceeded);
+        }
 
-        let key = canonical_pair(&e, token_in.clone(), token_out.clone());
-        assert!(pair_exists(&e, &key), "anchorswap: pair does not exist");
+        let new_in = reserve_in.checked_add(amount_in).ok_or(Error::Overflow)?;
+        let new_out = reserve_out - amount_out; // amount_out < reserve_out by construction
+        let (ra, rb) = order(in_is_a, new_in, new_out);
+        state.reserve_a = ra;
+        state.reserve_b = rb;
+        storage::set_pair(&e, &key, &state);
 
-        // Determine which canonical slot is `in` and which is `out`.
-        let bytes_in: Bytes = token_in.clone().to_xdr(&e);
-        let bytes_key0: Bytes = key.0.clone().to_xdr(&e);
-        let (reserve_in, reserve_out, in_is_a) = if bytes_in == bytes_key0 {
-            (get_reserve_a(&e, &key), get_reserve_b(&e, &key), true)
-        } else {
-            (get_reserve_b(&e, &key), get_reserve_a(&e, &key), false)
-        };
+        let this = e.current_contract_address();
+        token::TokenClient::new(&e, &token_in).transfer(&user, &this, &amount_in);
+        token::TokenClient::new(&e, &token_out).transfer(&this, &user, &amount_out);
 
-        assert!(reserve_in > 0 && reserve_out > 0, "anchorswap: empty pool");
-
-        // Uniswap v2 formula with 0.3 % fee.
-        let amount_in_with_fee = amount_in
-            .checked_mul(997)
-            .expect("anchorswap: overflow amount_in_with_fee");
-        let numerator = amount_in_with_fee
-            .checked_mul(reserve_out)
-            .expect("anchorswap: overflow numerator");
-        let denominator = reserve_in
-            .checked_mul(1000)
-            .expect("anchorswap: overflow denominator base")
-            .checked_add(amount_in_with_fee)
-            .expect("anchorswap: overflow denominator");
-        let amount_out = numerator / denominator;
-
-        assert!(amount_out >= min_out, "anchorswap: insufficient output amount");
-        assert!(amount_out > 0, "anchorswap: zero output amount");
-
-        // Transfer token_in from user to contract.
-        let contract_addr = e.current_contract_address();
-        token::Client::new(&e, &token_in).transfer(&user, &contract_addr, &amount_in);
-
-        // Transfer token_out from contract to user.
-        token::Client::new(&e, &token_out).transfer(&contract_addr, &user, &amount_out);
-
-        // Update reserves.
-        let (new_ra, new_rb) = if in_is_a {
-            (
-                reserve_in
-                    .checked_add(amount_in)
-                    .expect("anchorswap: reserve_in overflow"),
-                reserve_out
-                    .checked_sub(amount_out)
-                    .expect("anchorswap: reserve_out underflow"),
-            )
-        } else {
-            (
-                reserve_out
-                    .checked_sub(amount_out)
-                    .expect("anchorswap: reserve_out underflow"),
-                reserve_in
-                    .checked_add(amount_in)
-                    .expect("anchorswap: reserve_in overflow"),
-            )
-        };
-        set_reserve_a(&e, &key, new_ra);
-        set_reserve_b(&e, &key, new_rb);
-
-        e.events().publish(
-            (symbol_short!("Swapped"),),
-            (
-                token_in.clone(),
-                token_out.clone(),
-                amount_in,
-                amount_out,
-                user.clone(),
-            ),
-        );
-
-        unlock(&e);
-        amount_out
+        Swap {
+            user,
+            token_in,
+            token_out,
+            amount_in,
+            amount_out,
+        }
+        .publish(&e);
+        Ok(amount_out)
     }
 
-    // ── Read-only views ───────────────────────────────────────────────────────
+    // ── Views ────────────────────────────────────────────────────────────────
 
-    /// Return `(reserve_a, reserve_b)` in canonical order for the pair.
-    pub fn get_reserves(e: Env, token_a: Address, token_b: Address) -> (i128, i128) {
-        let key = canonical_pair(&e, token_a, token_b);
-        (get_reserve_a(&e, &key), get_reserve_b(&e, &key))
+    /// Exact output `swap_exact_in` would give right now (fee included).
+    pub fn get_amount_out(
+        e: Env,
+        token_in: Address,
+        token_out: Address,
+        amount_in: i128,
+    ) -> Result<i128, Error> {
+        let (_, in_is_a, state) = load_pair(&e, &token_in, &token_out)?;
+        let (reserve_in, reserve_out) = order(in_is_a, state.reserve_a, state.reserve_b);
+        math::amount_out(amount_in, reserve_in, reserve_out)
     }
 
-    /// Return the total LP-share supply for a pair.
-    pub fn total_shares(e: Env, token_a: Address, token_b: Address) -> i128 {
-        let key = canonical_pair(&e, token_a, token_b);
-        get_total_shares(&e, &key)
+    /// Reserves in the caller's token order: `(reserve_of_a, reserve_of_b)`.
+    pub fn get_reserves(e: Env, token_a: Address, token_b: Address) -> Result<(i128, i128), Error> {
+        let (_, in_order, state) = load_pair(&e, &token_a, &token_b)?;
+        Ok(order(in_order, state.reserve_a, state.reserve_b))
     }
 
-    /// Return the LP-share balance of `user` for a pair.
-    pub fn get_share(e: Env, token_a: Address, token_b: Address, user: Address) -> i128 {
-        let key = canonical_pair(&e, token_a, token_b);
-        get_share_balance(&e, &key, &user)
+    /// Full pool state in canonical order.
+    pub fn get_pair(e: Env, token_a: Address, token_b: Address) -> Result<PairState, Error> {
+        Ok(load_pair(&e, &token_a, &token_b)?.2)
     }
 
-    // ── Admin – upgrade ───────────────────────────────────────────────────────
+    pub fn get_pairs(e: Env) -> Vec<PairKey> {
+        storage::get_pairs(&e)
+    }
 
-    /// Replace the contract WASM. Admin only.
-    pub fn upgrade(e: Env, new_wasm_hash: BytesN<32>) {
-        require_admin(&e);
-        e.deployer().update_current_contract_wasm(new_wasm_hash);
+    pub fn get_shares(
+        e: Env,
+        token_a: Address,
+        token_b: Address,
+        user: Address,
+    ) -> Result<i128, Error> {
+        let (key, _, _) = load_pair(&e, &token_a, &token_b)?;
+        Ok(storage::get_shares(&e, &key, &user))
+    }
+
+    pub fn admin(e: Env) -> Address {
+        storage::get_admin(&e)
+    }
+
+    pub fn is_paused(e: Env) -> bool {
+        storage::is_paused(&e)
+    }
+
+    pub fn fee_bps(_e: Env) -> i128 {
+        FEE_BPS
     }
 }
-
-// ── Module declarations ───────────────────────────────────────────────────────
-/// Typed contract error codes (see `error.rs`).
-pub mod error;
-/// Ledger storage keys and typed helpers (see `storage.rs`).
-pub mod storage;
-
-#[cfg(test)]
-mod tests;

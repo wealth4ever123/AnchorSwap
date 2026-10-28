@@ -1,397 +1,543 @@
-//! AnchorSwap integration tests.
-//!
-//! Run with:
-//!   cargo test --features testutils
-//!
-//! Each test deploys fresh contract instances via the Soroban test environment
-//! so they are fully isolated.
-
-#![cfg(test)]
+//! Contract tests. Tokens are real Stellar Asset Contracts (the same token
+//! type used for XLM and classic assets on testnet/mainnet).
 
 extern crate std;
 
+use crate::{AnchorSwap, AnchorSwapClient, Error, PairState, MINIMUM_LIQUIDITY};
 use soroban_sdk::{
-    testutils::{Address as _, Ledger},
-    Address, Env, String,
+    testutils::{Address as _, AuthorizedFunction, Events as _, Ledger, MockAuth, MockAuthInvoke},
+    token::{StellarAssetClient, TokenClient},
+    Address, Env, IntoVal, Symbol,
 };
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Pull in the contracts we need to register
-// ──────────────────────────────────────────────────────────────────────────────
+const DEADLINE: u64 = 10_000;
+const NOW: u64 = 1_000;
 
-// Our AMM contract (defined in this crate).
-use crate::{AnchorSwap, AnchorSwapClient};
-
-// The sibling token contract registered natively (no WASM required).
-// The SDK generates `TokenContractClient` from `#[contract] pub struct TokenContract`.
-use soroban_token_contract::{TokenContract, TokenContractClient};
-
-// ──────────────────────────────────────────────────────────────────────────────
-// Test helpers
-// ──────────────────────────────────────────────────────────────────────────────
-
-/// Deploy the token contract, initialise it, and return its address + client.
-fn create_token<'a>(env: &'a Env, admin: &Address) -> (Address, TokenContractClient<'a>) {
-    let id = env.register_contract(None, TokenContract);
-    let client = TokenContractClient::new(env, &id);
-    client.initialize(
-        admin,
-        &7_u32,
-        &String::from_str(env, "TestToken"),
-        &String::from_str(env, "TT"),
-    );
-    (id, client)
+struct Setup<'a> {
+    env: Env,
+    admin: Address,
+    amm: AnchorSwapClient<'a>,
+    a: TokenClient<'a>,
+    b: TokenClient<'a>,
 }
 
-/// Deploy AnchorSwap, initialise it, and return its address + client.
-fn create_amm(env: &Env, admin: &Address) -> (Address, AnchorSwapClient) {
-    let id = env.register_contract(None, AnchorSwap);
-    let client = AnchorSwapClient::new(env, &id);
-    client.initialize(admin);
-    (id, client)
+fn new_token<'a>(env: &Env, admin: &Address) -> (TokenClient<'a>, StellarAssetClient<'a>) {
+    let sac = env.register_stellar_asset_contract_v2(admin.clone());
+    (
+        TokenClient::new(env, &sac.address()),
+        StellarAssetClient::new(env, &sac.address()),
+    )
 }
 
-// ──────────────────────────────────────────────────────────────────────────────
-// Tests
-// ──────────────────────────────────────────────────────────────────────────────
-
-/// Test 1: `init_pair` succeeds and reserves start at zero.
-#[test]
-fn pair_creation() {
+/// AMM with one A/B pair and `user` funded with 1e12 of each token.
+fn setup<'a>() -> (Setup<'a>, Address) {
     let env = Env::default();
     env.mock_all_auths();
-
+    env.ledger().with_mut(|l| l.timestamp = NOW);
     let admin = Address::generate(&env);
-    let (token_a_id, _) = create_token(&env, &admin);
-    let (token_b_id, _) = create_token(&env, &admin);
-    let (_, amm) = create_amm(&env, &admin);
+    let user = Address::generate(&env);
 
-    amm.init_pair(&token_a_id, &token_b_id);
+    let (a, a_admin) = new_token(&env, &admin);
+    let (b, b_admin) = new_token(&env, &admin);
+    a_admin.mint(&user, &1_000_000_000_000);
+    b_admin.mint(&user, &1_000_000_000_000);
 
-    let (ra, rb) = amm.get_reserves(&token_a_id, &token_b_id);
-    assert_eq!(ra, 0);
-    assert_eq!(rb, 0);
-    assert_eq!(amm.total_shares(&token_a_id, &token_b_id), 0);
+    let id = env.register(AnchorSwap, (&admin,));
+    let amm = AnchorSwapClient::new(&env, &id);
+    amm.create_pair(&a.address, &b.address);
+    (
+        Setup {
+            env,
+            admin,
+            amm,
+            a,
+            b,
+        },
+        user,
+    )
 }
 
-/// Test 2: A second `init_pair` for the same pair must panic.
-#[test]
-#[should_panic(expected = "anchorswap: pair already exists")]
-fn duplicate_pair_rejected() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let admin = Address::generate(&env);
-    let (token_a_id, _) = create_token(&env, &admin);
-    let (token_b_id, _) = create_token(&env, &admin);
-    let (_, amm) = create_amm(&env, &admin);
-
-    amm.init_pair(&token_a_id, &token_b_id);
-    // Second call with same pair should panic.
-    amm.init_pair(&token_a_id, &token_b_id);
+fn fund(s: &Setup, who: &Address, amount: i128) {
+    StellarAssetClient::new(&s.env, &s.a.address).mint(who, &amount);
+    StellarAssetClient::new(&s.env, &s.b.address).mint(who, &amount);
 }
 
-/// Test 3: First LP receives `isqrt(a * b)` shares.
-///
-/// With `amount_a = 100` and `amount_b = 400`, expected shares = isqrt(40 000) = 200.
-#[test]
-fn first_lp_gets_sqrt_shares() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let admin = Address::generate(&env);
-    let provider = Address::generate(&env);
-
-    let (token_a_id, token_a) = create_token(&env, &admin);
-    let (token_b_id, token_b) = create_token(&env, &admin);
-    let (_, amm) = create_amm(&env, &admin);
-
-    token_a.mint(&provider, &1_000_i128);
-    token_b.mint(&provider, &1_000_i128);
-
-    amm.init_pair(&token_a_id, &token_b_id);
-
-    let (shares, new_ra, new_rb) = amm.add_liquidity(
-        &token_a_id,
-        &token_b_id,
-        &100_i128,
-        &400_i128,
-        &1_i128,
-        &provider,
-    );
-
-    assert_eq!(shares, 200, "expected isqrt(100*400) = 200");
-    // Canonical order may flip the amounts, but their sum must equal 500.
-    assert_eq!(new_ra + new_rb, 500, "total reserves should be 500");
-    assert_eq!(amm.total_shares(&token_a_id, &token_b_id), 200);
-    assert_eq!(amm.get_share(&token_a_id, &token_b_id, &provider), 200);
+fn seed(s: &Setup, user: &Address, a: i128, b: i128) -> i128 {
+    let (_, _, shares) =
+        s.amm
+            .add_liquidity(user, &s.a.address, &s.b.address, &a, &b, &0, &0, &DEADLINE);
+    shares
 }
 
-/// Test 4: A second LP deposit must be proportional to the existing reserves.
+// ── Setup / admin ────────────────────────────────────────────────────────────
+
 #[test]
-fn proportional_lp() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let admin = Address::generate(&env);
-    let provider1 = Address::generate(&env);
-    let provider2 = Address::generate(&env);
-
-    let (token_a_id, token_a) = create_token(&env, &admin);
-    let (token_b_id, token_b) = create_token(&env, &admin);
-    let (_, amm) = create_amm(&env, &admin);
-
-    token_a.mint(&provider1, &10_000_i128);
-    token_b.mint(&provider1, &10_000_i128);
-    token_a.mint(&provider2, &10_000_i128);
-    token_b.mint(&provider2, &10_000_i128);
-
-    amm.init_pair(&token_a_id, &token_b_id);
-
-    // First LP: 1 000 / 1 000 → 1 000 shares.
-    let (shares1, _, _) = amm.add_liquidity(
-        &token_a_id,
-        &token_b_id,
-        &1_000_i128,
-        &1_000_i128,
-        &1_i128,
-        &provider1,
+fn constructor_sets_admin_and_defaults() {
+    let (s, _) = setup();
+    assert_eq!(s.amm.admin(), s.admin);
+    assert!(!s.amm.is_paused());
+    assert_eq!(s.amm.fee_bps(), 30);
+    assert_eq!(s.amm.get_pairs().len(), 1);
+    assert_eq!(
+        s.amm.get_pair(&s.a.address, &s.b.address),
+        PairState {
+            reserve_a: 0,
+            reserve_b: 0,
+            total_shares: 0
+        }
     );
-    assert_eq!(shares1, 1_000);
-
-    // Second LP deposits the same ratio.
-    let (shares2, _, _) = amm.add_liquidity(
-        &token_a_id,
-        &token_b_id,
-        &1_000_i128,
-        &1_000_i128,
-        &1_i128,
-        &provider2,
-    );
-
-    // shares2 = min(1 000 * 1 000 / 1 000, 1 000 * 1 000 / 1 000) = 1 000
-    assert_eq!(shares2, 1_000, "second LP should receive proportional shares");
-    assert_eq!(amm.total_shares(&token_a_id, &token_b_id), 2_000);
 }
 
-/// Test 5: After a swap the constant-product invariant k = ra * rb must not
-/// decrease (the fee strictly increases it).
 #[test]
-fn swap_price_impact() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let admin = Address::generate(&env);
-    let provider = Address::generate(&env);
-    let swapper = Address::generate(&env);
-
-    let (token_a_id, token_a) = create_token(&env, &admin);
-    let (token_b_id, token_b) = create_token(&env, &admin);
-    let (_, amm) = create_amm(&env, &admin);
-
-    token_a.mint(&provider, &100_000_i128);
-    token_b.mint(&provider, &100_000_i128);
-    token_a.mint(&swapper, &10_000_i128);
-
-    amm.init_pair(&token_a_id, &token_b_id);
-    amm.add_liquidity(
-        &token_a_id,
-        &token_b_id,
-        &10_000_i128,
-        &10_000_i128,
-        &1_i128,
-        &provider,
-    );
-
-    let (ra_before, rb_before) = amm.get_reserves(&token_a_id, &token_b_id);
-    let k_before = ra_before * rb_before;
-
-    let amount_out =
-        amm.swap_exact_in(&token_a_id, &token_b_id, &1_000_i128, &1_i128, &swapper);
-    assert!(amount_out > 0, "should receive some token_b");
-
-    let (ra_after, rb_after) = amm.get_reserves(&token_a_id, &token_b_id);
-    let k_after = ra_after * rb_after;
-
-    assert!(
-        k_after >= k_before,
-        "constant product must not decrease: k_before={k_before}, k_after={k_after}"
-    );
-
-    // Swapper received token_b (or token_a depending on canonical order).
-    // At minimum they received something from the output token.
-    let _ = amount_out; // verified non-zero above
+fn create_pair_requires_admin_auth() {
+    let (s, _) = setup();
+    let (c, _) = new_token(&s.env, &s.admin);
+    s.amm.create_pair(&s.a.address, &c.address);
+    let auths = s.env.auths();
+    assert_eq!(auths.len(), 1);
+    assert_eq!(auths[0].0, s.admin);
+    match &auths[0].1.function {
+        AuthorizedFunction::Contract((_, name, _)) => {
+            assert_eq!(name, &Symbol::new(&s.env, "create_pair"))
+        }
+        _ => panic!("unexpected auth"),
+    }
 }
 
-/// Test 6: A swap that would produce less than `min_out` must panic.
 #[test]
-#[should_panic(expected = "anchorswap: insufficient output amount")]
-fn slippage_rejection() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let admin = Address::generate(&env);
-    let provider = Address::generate(&env);
-    let swapper = Address::generate(&env);
-
-    let (token_a_id, token_a) = create_token(&env, &admin);
-    let (token_b_id, token_b) = create_token(&env, &admin);
-    let (_, amm) = create_amm(&env, &admin);
-
-    token_a.mint(&provider, &100_000_i128);
-    token_b.mint(&provider, &100_000_i128);
-    token_a.mint(&swapper, &1_000_i128);
-
-    amm.init_pair(&token_a_id, &token_b_id);
-    amm.add_liquidity(
-        &token_a_id,
-        &token_b_id,
-        &10_000_i128,
-        &10_000_i128,
-        &1_i128,
-        &provider,
-    );
-
-    // Request unrealistically high min_out → should panic.
-    amm.swap_exact_in(&token_a_id, &token_b_id, &100_i128, &9_999_i128, &swapper);
+fn create_pair_rejects_non_admin() {
+    let (s, _) = setup();
+    let (c, _) = new_token(&s.env, &s.admin);
+    let attacker = Address::generate(&s.env);
+    // Only the attacker signs; the admin signature is missing.
+    s.env.mock_auths(&[MockAuth {
+        address: &attacker,
+        invoke: &MockAuthInvoke {
+            contract: &s.amm.address,
+            fn_name: "create_pair",
+            args: (&s.a.address, &c.address).into_val(&s.env),
+            sub_invokes: &[],
+        },
+    }]);
+    assert!(s.amm.try_create_pair(&s.a.address, &c.address).is_err());
+    assert_eq!(s.amm.get_pairs().len(), 1);
 }
 
-/// Test 7: Removing liquidity returns proportional tokens and burns shares.
 #[test]
-fn remove_liquidity_test() {
-    let env = Env::default();
-    env.mock_all_auths();
-
-    let admin = Address::generate(&env);
-    let provider = Address::generate(&env);
-
-    let (token_a_id, token_a) = create_token(&env, &admin);
-    let (token_b_id, token_b) = create_token(&env, &admin);
-    let (_, amm) = create_amm(&env, &admin);
-
-    token_a.mint(&provider, &10_000_i128);
-    token_b.mint(&provider, &10_000_i128);
-
-    amm.init_pair(&token_a_id, &token_b_id);
-
-    let (shares, _, _) = amm.add_liquidity(
-        &token_a_id,
-        &token_b_id,
-        &1_000_i128,
-        &1_000_i128,
-        &1_i128,
-        &provider,
+fn create_pair_validation() {
+    let (s, _) = setup();
+    assert_eq!(
+        s.amm.try_create_pair(&s.a.address, &s.a.address),
+        Err(Ok(Error::IdenticalTokens))
     );
-    assert_eq!(shares, 1_000);
-
-    let bal_a_before = token_a.balance(&provider);
-    let bal_b_before = token_b.balance(&provider);
-
-    // Remove half the shares.
-    let (out_a, out_b) = amm.remove_liquidity(
-        &token_a_id,
-        &token_b_id,
-        &500_i128,
-        &1_i128,
-        &1_i128,
-        &provider,
+    // Same pair in either order is a duplicate.
+    assert_eq!(
+        s.amm.try_create_pair(&s.b.address, &s.a.address),
+        Err(Ok(Error::PairAlreadyExists))
     );
-
-    // Should recover exactly half of each token.
-    assert_eq!(out_a + out_b, 1_000, "should recover half the liquidity");
-
-    // Shares halved.
-    assert_eq!(amm.get_share(&token_a_id, &token_b_id, &provider), 500);
-    assert_eq!(amm.total_shares(&token_a_id, &token_b_id), 500);
-
-    // Token balances increased by the withdrawn amounts.
-    assert_eq!(token_a.balance(&provider), bal_a_before + out_a);
-    assert_eq!(token_b.balance(&provider), bal_b_before + out_b);
+    // An address that is not a token contract is rejected.
+    let not_a_token = Address::generate(&s.env);
+    assert!(s.amm.try_create_pair(&s.a.address, &not_a_token).is_err());
 }
 
-/// Test 8: Full lifecycle — create pair → add liquidity → swap → remove liquidity.
 #[test]
-fn full_lifecycle() {
-    let env = Env::default();
-    env.mock_all_auths();
-    env.ledger().with_mut(|l| l.sequence_number = 100);
+fn set_admin_needs_both_signatures() {
+    let (s, _) = setup();
+    let new_admin = Address::generate(&s.env);
+    s.amm.set_admin(&new_admin);
+    let signers: std::vec::Vec<Address> = s.env.auths().into_iter().map(|a| a.0).collect();
+    assert!(signers.contains(&s.admin));
+    assert!(signers.contains(&new_admin));
+    assert_eq!(s.amm.admin(), new_admin);
+}
 
-    let admin = Address::generate(&env);
-    let provider = Address::generate(&env);
-    let swapper = Address::generate(&env);
+#[test]
+fn upgrade_rejects_non_admin() {
+    let (s, _) = setup();
+    let attacker = Address::generate(&s.env);
+    let hash = soroban_sdk::BytesN::from_array(&s.env, &[7; 32]);
+    s.env.mock_auths(&[MockAuth {
+        address: &attacker,
+        invoke: &MockAuthInvoke {
+            contract: &s.amm.address,
+            fn_name: "upgrade",
+            args: (&hash,).into_val(&s.env),
+            sub_invokes: &[],
+        },
+    }]);
+    assert!(s.amm.try_upgrade(&hash).is_err());
+}
 
-    let (token_a_id, token_a) = create_token(&env, &admin);
-    let (token_b_id, token_b) = create_token(&env, &admin);
-    let (_, amm) = create_amm(&env, &admin);
+// ── Liquidity ────────────────────────────────────────────────────────────────
 
-    token_a.mint(&provider, &50_000_i128);
-    token_b.mint(&provider, &50_000_i128);
-    token_a.mint(&swapper, &5_000_i128);
+#[test]
+fn first_deposit_mints_sqrt_minus_locked() {
+    let (s, user) = setup();
+    let shares = seed(&s, &user, 4_000_000, 1_000_000);
+    assert_eq!(shares, 2_000_000 - MINIMUM_LIQUIDITY);
+    assert_eq!(s.amm.get_shares(&s.a.address, &s.b.address, &user), shares);
+    let p = s.amm.get_pair(&s.a.address, &s.b.address);
+    assert_eq!(p.total_shares, 2_000_000);
+    assert_eq!(s.a.balance(&s.amm.address), 4_000_000);
+    assert_eq!(s.b.balance(&s.amm.address), 1_000_000);
+}
 
-    // ── Step 1: create pair ───────────────────────────────────────────────────
-    amm.init_pair(&token_a_id, &token_b_id);
-    let (ra, rb) = amm.get_reserves(&token_a_id, &token_b_id);
-    assert_eq!((ra, rb), (0, 0));
-
-    // ── Step 2: add liquidity ─────────────────────────────────────────────────
-    let (shares, new_ra, new_rb) = amm.add_liquidity(
-        &token_a_id,
-        &token_b_id,
-        &10_000_i128,
-        &10_000_i128,
-        &1_i128,
-        &provider,
+#[test]
+fn first_deposit_too_small_is_rejected() {
+    let (s, user) = setup();
+    let r = s.amm.try_add_liquidity(
+        &user,
+        &s.a.address,
+        &s.b.address,
+        &1_000,
+        &1_000,
+        &0,
+        &0,
+        &DEADLINE,
     );
-    assert_eq!(shares, 10_000);
-    assert_eq!(new_ra + new_rb, 20_000);
+    assert_eq!(r, Err(Ok(Error::InsufficientLiquidity)));
+}
 
-    // ── Step 3: swap ──────────────────────────────────────────────────────────
-    let amount_out =
-        amm.swap_exact_in(&token_a_id, &token_b_id, &1_000_i128, &1_i128, &swapper);
-    assert!(amount_out > 0, "should receive tokens from swap");
+#[test]
+fn second_deposit_only_takes_matching_ratio() {
+    let (s, user) = setup();
+    seed(&s, &user, 2_000_000, 1_000_000);
+    let lp2 = Address::generate(&s.env);
+    fund(&s, &lp2, 1_000_000);
 
-    let (ra2, rb2) = amm.get_reserves(&token_a_id, &token_b_id);
-    assert!(
-        ra2 * rb2 >= new_ra * new_rb,
-        "constant product must not decrease"
+    let (got_a, got_b, shares) = s.amm.add_liquidity(
+        &lp2,
+        &s.a.address,
+        &s.b.address,
+        &1_000_000,
+        &1_000_000,
+        &0,
+        &0,
+        &DEADLINE,
     );
+    assert_eq!((got_a, got_b), (1_000_000, 500_000));
+    assert!(shares > 0);
+    // The extra 500_000 B stays with the provider.
+    assert_eq!(s.b.balance(&lp2), 500_000);
+}
 
-    // ── Step 4: remove all liquidity ─────────────────────────────────────────
-    let (out_a, out_b) = amm.remove_liquidity(
-        &token_a_id,
-        &token_b_id,
+#[test]
+fn deposit_respects_caller_token_order() {
+    let (s, user) = setup();
+    seed(&s, &user, 2_000_000, 1_000_000);
+    // Same deposit, tokens passed as (B, A): amounts must follow that order.
+    let (got_b, got_a, _) = s.amm.add_liquidity(
+        &user,
+        &s.b.address,
+        &s.a.address,
+        &500_000,
+        &5_000_000,
+        &0,
+        &0,
+        &DEADLINE,
+    );
+    assert_eq!((got_b, got_a), (500_000, 1_000_000));
+    assert_eq!(
+        s.amm.get_reserves(&s.b.address, &s.a.address),
+        (1_500_000, 3_000_000)
+    );
+}
+
+#[test]
+fn deposit_slippage_minimums() {
+    let (s, user) = setup();
+    seed(&s, &user, 2_000_000, 1_000_000);
+    let r = s.amm.try_add_liquidity(
+        &user,
+        &s.a.address,
+        &s.b.address,
+        &1_000_000,
+        &1_000_000,
+        &0,
+        &600_000,
+        &DEADLINE,
+    );
+    assert_eq!(r, Err(Ok(Error::SlippageExceeded)));
+}
+
+#[test]
+fn remove_all_returns_everything_but_locked_dust() {
+    let (s, user) = setup();
+    let before_a = s.a.balance(&user);
+    let before_b = s.b.balance(&user);
+    let shares = seed(&s, &user, 4_000_000, 1_000_000);
+    let (out_a, out_b) = s.amm.remove_liquidity(
+        &user,
+        &s.a.address,
+        &s.b.address,
         &shares,
-        &1_i128,
-        &1_i128,
-        &provider,
+        &0,
+        &0,
+        &DEADLINE,
     );
-
-    assert!(out_a > 0 && out_b > 0, "provider should receive tokens");
-    assert_eq!(amm.total_shares(&token_a_id, &token_b_id), 0);
-    assert_eq!(amm.get_share(&token_a_id, &token_b_id, &provider), 0);
-
-    let (final_ra, final_rb) = amm.get_reserves(&token_a_id, &token_b_id);
-    assert!(
-        final_ra < 10,
-        "pool should be nearly empty, got ra={final_ra}"
-    );
-    assert!(
-        final_rb < 10,
-        "pool should be nearly empty, got rb={final_rb}"
+    // Locked shares (1000 of 2_000_000) keep 0.05 % of the reserves.
+    assert_eq!((out_a, out_b), (3_998_000, 999_500));
+    assert_eq!(s.a.balance(&user), before_a - 2_000);
+    assert_eq!(s.b.balance(&user), before_b - 500);
+    assert_eq!(s.amm.get_shares(&s.a.address, &s.b.address, &user), 0);
+    assert_eq!(
+        s.amm.get_pair(&s.a.address, &s.b.address).total_shares,
+        MINIMUM_LIQUIDITY
     );
 }
 
-/// Test 9: isqrt correctness for known values.
 #[test]
-fn isqrt_correctness() {
-    use crate::isqrt;
+fn remove_validation() {
+    let (s, user) = setup();
+    let shares = seed(&s, &user, 4_000_000, 1_000_000);
+    let other = Address::generate(&s.env);
+    let rm = |who: &Address, n: i128, min_a: i128, min_b: i128| {
+        s.amm.try_remove_liquidity(
+            who,
+            &s.a.address,
+            &s.b.address,
+            &n,
+            &min_a,
+            &min_b,
+            &DEADLINE,
+        )
+    };
+    assert_eq!(rm(&user, 0, 0, 0), Err(Ok(Error::InvalidAmount)));
+    assert_eq!(
+        rm(&user, shares + 1, 0, 0),
+        Err(Ok(Error::InsufficientShares))
+    );
+    assert_eq!(rm(&other, 1, 0, 0), Err(Ok(Error::InsufficientShares)));
+    assert_eq!(
+        rm(&user, shares, 4_000_000, 0),
+        Err(Ok(Error::SlippageExceeded))
+    );
+}
 
-    assert_eq!(isqrt(0), 0);
-    assert_eq!(isqrt(1), 1);
-    assert_eq!(isqrt(4), 2);
-    assert_eq!(isqrt(9), 3);
-    assert_eq!(isqrt(40_000), 200);
-    assert_eq!(isqrt(99), 9);
-    assert_eq!(isqrt(100), 10);
-    assert_eq!(isqrt(1_000_000_000_000_i128), 1_000_000_i128);
+#[test]
+fn liquidity_calls_require_provider_auth() {
+    let (s, user) = setup();
+    seed(&s, &user, 4_000_000, 1_000_000);
+    let auths = s.env.auths();
+    assert_eq!(auths[0].0, user);
+    match &auths[0].1.function {
+        AuthorizedFunction::Contract((_, name, _)) => {
+            assert_eq!(name, &Symbol::new(&s.env, "add_liquidity"))
+        }
+        _ => panic!("unexpected auth"),
+    }
+}
+
+// ── Swap ─────────────────────────────────────────────────────────────────────
+
+#[test]
+fn swap_moves_tokens_and_matches_quote() {
+    let (s, user) = setup();
+    seed(&s, &user, 1_000_000_000, 1_000_000_000);
+    let trader = Address::generate(&s.env);
+    StellarAssetClient::new(&s.env, &s.a.address).mint(&trader, &10_000_000);
+
+    let quote = s
+        .amm
+        .get_amount_out(&s.a.address, &s.b.address, &10_000_000);
+    let out = s.amm.swap_exact_in(
+        &trader,
+        &s.a.address,
+        &s.b.address,
+        &10_000_000,
+        &quote,
+        &DEADLINE,
+    );
+    assert_eq!(out, quote);
+    assert_eq!(out, 9_871_580); // 1 % of pool, 0.3 % fee + price impact
+    assert_eq!(s.a.balance(&trader), 0);
+    assert_eq!(s.b.balance(&trader), out);
+    assert_eq!(
+        s.amm.get_reserves(&s.a.address, &s.b.address),
+        (1_010_000_000, 1_000_000_000 - out)
+    );
+}
+
+#[test]
+fn swap_requires_user_auth_for_exact_call() {
+    let (s, user) = setup();
+    seed(&s, &user, 1_000_000_000, 1_000_000_000);
+    s.amm
+        .swap_exact_in(&user, &s.a.address, &s.b.address, &1_000, &0, &DEADLINE);
+    let auths = s.env.auths();
+    assert_eq!(auths.len(), 1);
+    assert_eq!(auths[0].0, user);
+    match &auths[0].1.function {
+        AuthorizedFunction::Contract((addr, name, args)) => {
+            assert_eq!(addr, &s.amm.address);
+            assert_eq!(name, &Symbol::new(&s.env, "swap_exact_in"));
+            assert_eq!(args.len(), 6);
+        }
+        _ => panic!("unexpected auth"),
+    }
+}
+
+#[test]
+fn swap_cannot_spend_someone_elses_tokens() {
+    let (s, user) = setup();
+    seed(&s, &user, 1_000_000_000, 1_000_000_000);
+    let attacker = Address::generate(&s.env);
+    s.env.mock_auths(&[MockAuth {
+        address: &attacker,
+        invoke: &MockAuthInvoke {
+            contract: &s.amm.address,
+            fn_name: "swap_exact_in",
+            args: (
+                &user,
+                &s.a.address,
+                &s.b.address,
+                1_000i128,
+                0i128,
+                DEADLINE,
+            )
+                .into_val(&s.env),
+            sub_invokes: &[],
+        },
+    }]);
+    let r = s
+        .amm
+        .try_swap_exact_in(&user, &s.a.address, &s.b.address, &1_000, &0, &DEADLINE);
+    assert!(r.is_err());
+}
+
+#[test]
+fn swap_slippage_and_validation() {
+    let (s, user) = setup();
+    seed(&s, &user, 1_000_000_000, 1_000_000_000);
+    let quote = s
+        .amm
+        .get_amount_out(&s.a.address, &s.b.address, &10_000_000);
+    let swap = |amount: i128, min: i128, deadline: u64| {
+        s.amm
+            .try_swap_exact_in(&user, &s.a.address, &s.b.address, &amount, &min, &deadline)
+    };
+    assert_eq!(
+        swap(10_000_000, quote + 1, DEADLINE),
+        Err(Ok(Error::SlippageExceeded))
+    );
+    assert_eq!(swap(0, 0, DEADLINE), Err(Ok(Error::InvalidAmount)));
+    assert_eq!(swap(-5, 0, DEADLINE), Err(Ok(Error::InvalidAmount)));
+    assert_eq!(swap(10, -1, DEADLINE), Err(Ok(Error::InvalidAmount)));
+    assert_eq!(swap(1, 0, DEADLINE), Err(Ok(Error::InsufficientLiquidity)));
+    assert_eq!(swap(1_000, 0, NOW - 1), Err(Ok(Error::DeadlineExpired)));
+    assert_eq!(
+        s.amm
+            .try_swap_exact_in(&user, &s.a.address, &s.a.address, &1_000, &0, &DEADLINE),
+        Err(Ok(Error::IdenticalTokens))
+    );
+}
+
+#[test]
+fn swap_on_missing_or_empty_pair_fails() {
+    let (s, user) = setup();
+    assert_eq!(
+        s.amm
+            .try_swap_exact_in(&user, &s.a.address, &s.b.address, &1_000, &0, &DEADLINE),
+        Err(Ok(Error::InsufficientLiquidity))
+    );
+    let (c, _) = new_token(&s.env, &s.admin);
+    assert_eq!(
+        s.amm
+            .try_swap_exact_in(&user, &s.a.address, &c.address, &1_000, &0, &DEADLINE),
+        Err(Ok(Error::PairNotFound))
+    );
+}
+
+#[test]
+fn fees_grow_lp_value_over_round_trips() {
+    let (s, user) = setup();
+    let shares = seed(&s, &user, 1_000_000_000, 1_000_000_000);
+    let trader = Address::generate(&s.env);
+    fund(&s, &trader, 1_000_000_000);
+    let k0 = 1_000_000_000i128 * 1_000_000_000;
+
+    for i in 0..20 {
+        let (tin, tout) = if i % 2 == 0 {
+            (&s.a.address, &s.b.address)
+        } else {
+            (&s.b.address, &s.a.address)
+        };
+        s.amm
+            .swap_exact_in(&trader, tin, tout, &50_000_000, &0, &DEADLINE);
+    }
+    let p = s.amm.get_pair(&s.a.address, &s.b.address);
+    assert!(p.reserve_a * p.reserve_b > k0, "fees must increase k");
+
+    let (out_a, out_b) = s.amm.remove_liquidity(
+        &user,
+        &s.a.address,
+        &s.b.address,
+        &shares,
+        &0,
+        &0,
+        &DEADLINE,
+    );
+    assert!(
+        out_a + out_b > 2 * (1_000_000_000 - 1_000),
+        "LP earned fees"
+    );
+    // The contract never holds less than its recorded reserves.
+    let p = s.amm.get_pair(&s.a.address, &s.b.address);
+    assert!(s.a.balance(&s.amm.address) >= p.reserve_a);
+    assert!(s.b.balance(&s.amm.address) >= p.reserve_b);
+}
+
+// ── Pause ────────────────────────────────────────────────────────────────────
+
+#[test]
+fn pause_blocks_swaps_and_deposits_but_not_withdrawals() {
+    let (s, user) = setup();
+    let shares = seed(&s, &user, 4_000_000, 1_000_000);
+    s.amm.set_paused(&true);
+    assert!(s.amm.is_paused());
+    assert_eq!(
+        s.amm
+            .try_swap_exact_in(&user, &s.a.address, &s.b.address, &1_000, &0, &DEADLINE),
+        Err(Ok(Error::Paused))
+    );
+    assert_eq!(
+        s.amm.try_add_liquidity(
+            &user,
+            &s.a.address,
+            &s.b.address,
+            &1_000,
+            &1_000,
+            &0,
+            &0,
+            &DEADLINE
+        ),
+        Err(Ok(Error::Paused))
+    );
+    s.amm.remove_liquidity(
+        &user,
+        &s.a.address,
+        &s.b.address,
+        &shares,
+        &0,
+        &0,
+        &DEADLINE,
+    );
+    s.amm.set_paused(&false);
+    assert!(!s.amm.is_paused());
+}
+
+#[test]
+fn events_are_emitted() {
+    let (s, user) = setup();
+    seed(&s, &user, 1_000_000_000, 1_000_000_000);
+    s.amm
+        .swap_exact_in(&user, &s.a.address, &s.b.address, &1_000_000, &0, &DEADLINE);
+    let from_amm = s
+        .env
+        .events()
+        .all()
+        .filter_by_contract(&s.amm.address)
+        .events()
+        .len();
+    assert_eq!(from_amm, 1, "the swap emits exactly one AMM event");
 }
