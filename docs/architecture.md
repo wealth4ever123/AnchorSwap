@@ -1,158 +1,98 @@
-# AnchorSwap – Architecture
+# Architecture
 
-## Overview
+AnchorSwap has three parts:
 
-AnchorSwap is a permissionless, constant-product Automated Market Maker (AMM) deployed as a Soroban smart contract on the Stellar network. The system is split into three layers:
+1. **`contracts/anchorswap`**: a Soroban smart contract that holds many
+   constant-product pools in one contract.
+2. **`frontend`**: a Next.js app. It runs entirely in the browser and talks
+   directly to public Stellar services. There is no AnchorSwap backend.
+3. **Stellar services**: Stellar RPC (Soroban simulation, submission,
+   results), Horizon (balances, DEX path finding, a second confirmation)
+   and the user's wallet (signing).
 
-```
-┌─────────────────────────────────────────────────────────────────────┐
-│                         User (Browser)                              │
-│                                                                     │
-│   ┌─────────────────────────────────────────────────────────────┐  │
-│   │                    Next.js 15 Frontend                      │  │
-│   │  SwapForm  │  AddLiquidityForm  │  RemoveLiquidityForm      │  │
-│   └──────────────────────┬──────────────────────────────────────┘  │
-│                          │ XDR envelope (unsigned)                  │
-│   ┌──────────────────────▼──────────────────────────────────────┐  │
-│   │           Freighter Wallet Extension (browser)              │  │
-│   └──────────────────────┬──────────────────────────────────────┘  │
-│                          │ Signed XDR envelope                     │
-└──────────────────────────┼──────────────────────────────────────────┘
-                           │ HTTPS / JSON-RPC
-         ┌─────────────────▼──────────────────────┐
-         │        Stellar Soroban RPC Node         │
-         │  (soroban-testnet.stellar.org)          │
-         └─────────────────┬──────────────────────┘
-                           │ Transaction submission
-         ┌─────────────────▼──────────────────────┐
-         │         Stellar Consensus (SCP)         │
-         │  Ledger closes every ~5 seconds         │
-         └─────────────────┬──────────────────────┘
-                           │ State updates
-         ┌─────────────────▼──────────────────────┐
-         │     AnchorSwap Soroban Contract         │
-         │                                         │
-         │  ┌──────────┐  ┌──────────┐            │
-         │  │ AMM Core │  │ Storage  │            │
-         │  │ (lib.rs) │  │ Keys     │            │
-         │  └──────────┘  └──────────┘            │
-         │  ┌──────────┐  ┌──────────┐            │
-         │  │  Errors  │  │ Re-entry │            │
-         │  │(error.rs)│  │  Guard   │            │
-         │  └──────────┘  └──────────┘            │
-         └─────────────────────────────────────────┘
+```mermaid
+flowchart LR
+  subgraph Browser
+    UI[React UI<br/>Swap / Pool / History]
+    LIB[lib/<br/>quotes, amm, dex, tx]
+    W[Wallet<br/>Freighter, xBull, ...]
+  end
+  RPC[(Stellar RPC)]
+  HZ[(Horizon)]
+  C[[AnchorSwap contract]]
+  DEX[[Stellar DEX<br/>order books + classic pools]]
+
+  UI --> LIB
+  LIB -- simulate get_amount_out / get_pair --> RPC
+  LIB -- strict-send paths, balances --> HZ
+  LIB -- unsigned tx --> W
+  W -- signed tx --> LIB
+  LIB -- sendTransaction / getTransaction --> RPC
+  LIB -- verify hash --> HZ
+  RPC --- C
+  RPC --- DEX
 ```
 
----
+## Swap, step by step
 
-## Component descriptions
+1. **Quote.** `lib/quotes.ts` asks both venues in parallel:
+   - AnchorSwap: simulates the contract's `get_amount_out` through RPC. This is the exact amount the contract would pay out right now.
+   - Stellar DEX: Horizon `GET /paths/strict-send`, best path wins.
 
-### Frontend (Next.js 15 App Router)
+   Price impact is measured against the pool's spot price (AnchorSwap) or a quote for a 1/1000 slice of the trade (DEX). Quotes refresh every 15 s.
+2. **Review.** The user sees the route, rate, fee, price impact and minimum received (`amountOut × (1 − slippage)`, rounded down).
+3. **Re-quote.** On confirm, the app fetches a fresh quote. If it fell below the minimum the user approved, it stops and asks again. The minimum sent on-chain is never lower than the one the user confirmed.
+4. **Build.**
+   - AnchorSwap: `swap_exact_in(user, in, out, amount, min_out, deadline)`. The transaction is simulated and assembled with resource fees and authorization. If the simulation fails (for example on slippage), the user is never asked to sign.
+   - DEX: `pathPaymentStrictSend` with `destMin = min_out`.
+5. **Sign.** The wallet signs. `assertSignedFor` checks the signature belongs to the connected account and to the Testnet network ID. A wallet set to another network fails here.
+6. **Submit and confirm.** `submitAndWait` sends through RPC, then polls `getTransaction` until `SUCCESS` or `FAILED`. Only `SUCCESS` is shown as success. If there is no answer within 90 s, the status stays `pending` and is re-checked against Horizon later.
+7. **Record.** The result (hash, ledger, status, error) is saved to the browser's local history.
 
-| File | Purpose |
-|------|---------|
-| `app/page.tsx` | Landing page with protocol stats and feature cards |
-| `app/swap/page.tsx` | Swap dashboard – delegates to `SwapForm` |
-| `app/pool/page.tsx` | Pool browser – shows active pairs with live reserves |
-| `app/pool/add/page.tsx` | Add liquidity workflow |
-| `app/pool/remove/page.tsx` | Remove liquidity workflow |
-| `components/SwapForm.tsx` | Token input/output, slippage, swap execution |
-| `components/AddLiquidityForm.tsx` | Dual token input, share estimation, deposit |
-| `components/RemoveLiquidityForm.tsx` | Slider-based LP share withdrawal |
-| `components/PoolForm.tsx` | Tabbed Add/Remove container |
-| `components/Header.tsx` / `Navbar.tsx` | Wallet connect, navigation |
-| `components/PoolCard.tsx` | Pool statistics card |
-| `components/TokenSelect.tsx` | Dropdown token picker |
-| `lib/soroban.ts` | RPC simulation, transaction builders, formula helpers |
-| `lib/wallet.tsx` | Freighter wallet context + `useWallet` hook |
-| `lib/tokens.ts` | Well-known token registry |
-| `hooks/usePairStats.ts` | Polling hook for live reserve data |
-
-### Soroban Smart Contract (`contracts/anchorswap`)
-
-| Module | Purpose |
-|--------|---------|
-| `lib.rs` | Contract entrypoint — `AnchorSwap` struct + all public functions |
-| `storage.rs` | Type-safe `StorageKey` enum, typed get/set helpers, TTL management |
-| `error.rs` | `ContractError` enum (`#[contracterror]`), 8 variants |
-| `tests/unit.rs` | 15+ unit tests for individual invariants |
-| `tests/integration.rs` | 5 end-to-end scenario tests |
-| `test.rs` | Original comprehensive test file (preserved) |
-
----
-
-## Data flow: Swap
+## Contract layout
 
 ```
-User types amount → SwapForm calls computeSwapOut() locally (no RPC)
-→ User clicks Swap
-→ buildSwapTx() constructs TransactionBuilder with swap_exact_in call
-→ server.prepareTransaction() estimates fee & fetches ledger sequence
-→ Freighter.signTransaction() prompts user to approve
-→ submitSignedTx() sends to Soroban RPC
-→ Contract: require_not_locked() → lock()
-→ canonical_pair() maps tokens to storage key
-→ Uniswap v2 formula computes amount_out
-→ assert(amount_out >= min_out)  ← slippage guard
-→ token_in.transfer(user → contract)
-→ token_out.transfer(contract → user)
-→ update reserves
-→ emit Swapped event
-→ unlock()
-→ RPC returns tx hash
-→ Frontend shows success + stellar.expert link
+contracts/anchorswap/src/
+├── lib.rs      entry points, events, auth
+├── math.rs     pure AMM math (amount_out, deposit, withdraw, isqrt) + tests
+├── storage.rs  storage keys, canonical pair ordering, TTL extension
+├── error.rs    typed error codes
+└── test.rs     contract tests with real Stellar Asset Contracts
 ```
 
-## Data flow: Add Liquidity
+| Storage key | Tier | Contents |
+|---|---|---|
+| `Admin`, `Paused` | instance | admin address, pause flag |
+| `Pairs` | persistent | list of pools (max 100) |
+| `Pair(PairKey)` | persistent | `reserve_a`, `reserve_b`, `total_shares` |
+| `Shares(PairKey, Address)` | persistent | one provider's LP shares |
+
+A `PairKey` holds the two token addresses sorted by their XDR bytes, so
+`(A, B)` and `(B, A)` are the same pool. Public functions take tokens in
+any order and return amounts in the caller's order.
+
+Every entry touched is given a longer lifetime (instance: 30 days;
+persistent: 60 days) so active pools are not archived. Ledger entries
+for fully withdrawn positions are deleted.
+
+## Frontend layout
 
 ```
-User selects pair + amounts → AddLiquidityForm fetches reserves via simulation
-→ Auto-fills second input to match current ratio
-→ Estimates LP shares (sqrt formula or proportional formula)
-→ buildAddLiquidityTx() constructs add_liquidity call
-→ Signed + submitted via Freighter
-→ Contract: lock → validate → compute shares → transfer tokens → mint shares → unlock
-→ Emits LiquidityAdded event
+frontend/src/
+├── config/testnet.json   deployed contract IDs (written by deploy script)
+├── lib/
+│   ├── config.ts         network endpoints, limits
+│   ├── tokens.ts         fixed token list, contract IDs derived from assets
+│   ├── amounts.ts        exact bigint parsing/formatting, slippage, impact
+│   ├── horizon.ts        balances, DEX quotes
+│   ├── amm.ts            contract views and tx builders
+│   ├── dex.ts            path payment and trustline tx builders
+│   ├── quotes.ts         best-route selection
+│   ├── tx.ts             signature check, submit, confirm, error decoding
+│   ├── history.ts        local tx history, re-checks via Horizon
+│   ├── walletAdapter.ts  Stellar Wallets Kit adapter (swappable in tests)
+│   └── wallet.tsx        React wallet context, network detection
+├── hooks/                useBalances, useQuote, useTxRunner
+├── components/           SwapCard, PoolPanel, HistoryList, ...
+└── app/                  routes: /, /swap, /pool, /history
 ```
-
-## Data flow: Remove Liquidity
-
-```
-User selects pair + slider percentage → estimated returns computed locally
-→ buildRemoveLiquidityTx() with share_amount + 1% slippage min values
-→ Contract: lock → check user balance → compute proportional amounts
-→ Enforce min_a / min_b slippage guards
-→ Burn shares → transfer tokens → unlock
-→ Emits LiquidityRemoved event
-```
-
----
-
-## Storage layout
-
-```
-Instance storage (fast, low cost, lives with contract instance TTL):
-  Admin              → Address
-  Locked             → bool
-  ReserveA(pair)     → i128
-  ReserveB(pair)     → i128
-  TotalShares(pair)  → i128   ← also doubles as "pair exists" flag
-
-Persistent storage (survives ledger eviction, has explicit TTL bumps):
-  ShareBalance(pair, user)  → i128
-  TTL: 6,307,200 ledgers (~1 year at 5s/ledger)
-  Threshold: 3,153,600 ledgers (bump when below half)
-```
-
----
-
-## Security model
-
-| Mechanism | Implementation |
-|-----------|---------------|
-| Re-entrancy guard | `Locked` bool in instance storage; `require_not_locked()` panics if already set; `lock()` / `unlock()` wrap every state-mutating function |
-| Slippage protection | Caller-supplied `min_share`, `min_a`, `min_b`, `min_out` checked before any state mutation |
-| Canonical token ordering | XDR byte-comparison in `canonical_pair()` prevents duplicate pairs and ensures deterministic storage keys |
-| Checked arithmetic | All multiplications and additions use `.checked_mul()` / `.checked_add()` / `.checked_sub()` with explicit `expect()` messages |
-| Auth | `provider.require_auth()` / `user.require_auth()` on all state-mutating calls; `admin.require_auth()` for `upgrade()` |
-| Upgrade restriction | WASM upgrade is gated behind admin authentication only |

@@ -8,7 +8,7 @@ module.exports = {
   theme: {
     extend: {
       fontFamily: {
-        sans: ["Inter", "system-ui", "sans-serif"],
+        sans: ["system-ui", "-apple-system", "Segoe UI", "Roboto", "sans-serif"],
       },
       colors: {
         anchor: {

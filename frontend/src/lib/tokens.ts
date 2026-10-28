@@ -1,53 +1,55 @@
+import { Asset } from "@stellar/stellar-sdk";
+import { DEPLOYMENT, NETWORK } from "./config";
+
 export interface Token {
   symbol: string;
   name: string;
-  address: string;
   decimals: number;
-  logoUrl?: string;
+  /** Classic Stellar asset (used for balances, trustlines and the DEX). */
+  asset: Asset;
+  /** Stellar Asset Contract ID (used by the AnchorSwap contract). */
+  contract: string;
 }
+
+function parseAsset(id: string): Asset {
+  if (id === "native") return Asset.native();
+  const [code, issuer] = id.split(":");
+  return new Asset(code, issuer);
+}
+
+function makeToken(symbol: string, name: string, assetId: string, expectedContract?: string): Token {
+  const asset = parseAsset(assetId);
+  const contract = asset.contractId(NETWORK.passphrase);
+  // The contract ID is derived from the asset, so a mismatch means the
+  // config was edited by hand or points at another network.
+  if (expectedContract && expectedContract !== contract) {
+    throw new Error(`Token ${symbol}: configured contract ${expectedContract} does not match asset ${assetId}`);
+  }
+  return { symbol, name, decimals: 7, asset, contract };
+}
+
+/** Circle's USDC issuer on Testnet. */
+export const TESTNET_USDC_ISSUER = "GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5";
 
 /**
- * Well-known Soroban testnet token addresses.
- * Replace with your deployed token contract IDs.
+ * The only tokens the app will trade. Users cannot paste arbitrary assets,
+ * which rules out look-alike or malicious tokens.
  */
-export const KNOWN_TOKENS: Token[] = [
-  {
-    symbol: "XLM",
-    name: "Stellar Lumens",
-    address: "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC",
-    decimals: 7,
-    logoUrl: "/tokens/xlm.svg",
-  },
-  {
-    symbol: "USDC",
-    name: "USD Coin",
-    address: "CBIELTK6YBZJU5UP2WWQEUCYKLPU6AUNZ2BQ4WWFEIE3USCIHMXQDAMA",
-    decimals: 7,
-    logoUrl: "/tokens/usdc.svg",
-  },
-  {
-    symbol: "ANC",
-    name: "AnchorSwap Token",
-    address: process.env.NEXT_PUBLIC_ANC_TOKEN ?? "CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM",
-    decimals: 7,
-    logoUrl: "/tokens/anc.svg",
-  },
+export const TOKENS: Token[] = [
+  makeToken("XLM", "Stellar Lumens", "native", DEPLOYMENT.tokens.XLM.contract),
+  makeToken("ANC", "AnchorSwap Test Token", DEPLOYMENT.tokens.ANC.asset, DEPLOYMENT.tokens.ANC.contract),
+  makeToken("USDC", "USD Coin (Circle testnet)", `USDC:${TESTNET_USDC_ISSUER}`),
 ];
 
-export function getToken(address: string): Token | undefined {
-  return KNOWN_TOKENS.find(
-    (t) => t.address.toLowerCase() === address.toLowerCase()
-  );
+export function tokenBySymbol(symbol: string): Token | undefined {
+  return TOKENS.find((t) => t.symbol === symbol);
 }
 
-export function formatTokenAmount(raw: bigint, decimals = 7, precision = 4): string {
-  const divisor = BigInt(10 ** decimals);
-  const whole = raw / divisor;
-  const frac = raw % divisor;
-  const fracStr = frac
-    .toString()
-    .padStart(decimals, "0")
-    .slice(0, precision)
-    .replace(/0+$/, "");
-  return fracStr ? `${whole}.${fracStr}` : `${whole}`;
+export function tokenByContract(contract: string): Token | undefined {
+  return TOKENS.find((t) => t.contract === contract);
+}
+
+/** Stable key for a classic asset, matching Horizon's balance format. */
+export function assetKey(asset: Asset): string {
+  return asset.isNative() ? "native" : `${asset.getCode()}:${asset.getIssuer()}`;
 }

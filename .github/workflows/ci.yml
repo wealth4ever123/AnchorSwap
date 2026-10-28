@@ -1,13 +1,3 @@
-# AnchorSwap – GitHub Actions CI/CD Pipeline
-#
-# Triggers:
-#   • Every push to `main`
-#   • Every pull request targeting `main`
-#
-# Jobs run in parallel:
-#   1. rust-checks  – format, lint, and test the Soroban smart contracts
-#   2. frontend-checks – type-check, lint, and build the Next.js frontend
-
 name: CI
 
 on:
@@ -15,136 +5,89 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
-# Cancel any in-progress run for the same ref to save CI minutes.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-# ─── Shared env ───────────────────────────────────────────────────────────────
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: "-D warnings"      # Treat compiler warnings as errors
-  NODE_VERSION: "20"
-  RUST_VERSION: "1.78"          # Pin to a stable toolchain
+  STELLAR_CLI_VERSION: "28.1.0"
+  STELLAR_CLI_SHA256: "c1680deee94301d33ada7a17f98411e642a4248c727afbd2e43050d345746462"
 
-# =============================================================================
-# Job 1 – Rust smart-contract checks
-# =============================================================================
 jobs:
-  rust-checks:
-    name: Rust – Format / Clippy / Test
+  contracts:
+    name: Contracts (fmt, clippy, test, wasm)
     runs-on: ubuntu-latest
-
     steps:
-      # ── Checkout ────────────────────────────────────────────────────────────
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      # ── Rust toolchain ──────────────────────────────────────────────────────
-      - name: Install Rust toolchain (${{ env.RUST_VERSION }})
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: ${{ env.RUST_VERSION }}
-          targets: wasm32-unknown-unknown
+          targets: wasm32v1-none
           components: rustfmt, clippy
 
-      # ── Cache cargo registry & build artefacts ──────────────────────────────
-      - name: Cache Cargo registry
-        uses: actions/cache@v4
+      - uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
 
-      # ── Format ──────────────────────────────────────────────────────────────
-      - name: Check formatting (rustfmt)
-        run: cargo fmt --all -- --check
-
-      # ── Lint ────────────────────────────────────────────────────────────────
-      - name: Clippy lint (contracts)
+      - name: Install stellar-cli
         run: |
-          cargo clippy \
-            --all-targets \
-            --features testutils \
-            -- -D warnings
+          curl -sSLo cli.tgz "https://github.com/stellar/stellar-cli/releases/download/v${STELLAR_CLI_VERSION}/stellar-cli-${STELLAR_CLI_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          echo "${STELLAR_CLI_SHA256}  cli.tgz" | sha256sum -c -
+          tar xzf cli.tgz stellar && sudo install -m755 stellar /usr/local/bin/stellar
 
-      # ── Unit & integration tests ─────────────────────────────────────────────
-      - name: Run contract tests
-        run: |
-          cargo test \
-            --features testutils \
-            --workspace \
-            -- --nocapture
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+      - run: stellar contract build --package anchorswap
 
-      # ── WASM build (smoke test – ensures contract compiles for wasm32) ────────
-      - name: Build WASM artefact (release)
-        run: |
-          cargo build \
-            --target wasm32-unknown-unknown \
-            --release \
-            --package anchorswap
+      - uses: actions/upload-artifact@v4
+        with:
+          name: anchorswap-wasm
+          path: target/wasm32v1-none/release/anchorswap.wasm
 
-      - name: Assert WASM artefact exists
-        run: |
-          ls -lh target/wasm32-unknown-unknown/release/anchorswap.wasm
-          # Fail if the WASM is suspiciously large (> 1 MB unoptimised).
-          SIZE=$(stat -c%s target/wasm32-unknown-unknown/release/anchorswap.wasm)
-          echo "WASM size: ${SIZE} bytes"
-          [ "${SIZE}" -lt 1048576 ] || echo "Warning: WASM exceeds 1 MB – consider optimising"
-
-# =============================================================================
-# Job 2 – Next.js frontend checks
-# =============================================================================
-  frontend-checks:
-    name: Frontend – Lint / Type-check / Build
+  frontend:
+    name: Frontend (lint, types, tests, build)
     runs-on: ubuntu-latest
-
     defaults:
       run:
         working-directory: frontend
-
     steps:
-      # ── Checkout ────────────────────────────────────────────────────────────
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      # ── Node.js ─────────────────────────────────────────────────────────────
-      - name: Set up Node.js ${{ env.NODE_VERSION }}
-        uses: actions/setup-node@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
-          node-version: ${{ env.NODE_VERSION }}
+          node-version: 22
           cache: npm
           cache-dependency-path: frontend/package-lock.json
-
-      # ── Install dependencies ─────────────────────────────────────────────────
-      - name: Install npm dependencies
-        run: npm ci
-
-      # ── ESLint ──────────────────────────────────────────────────────────────
-      - name: Lint (ESLint)
-        run: npm run lint
-
-      # ── TypeScript type check ────────────────────────────────────────────────
-      - name: Type-check (tsc --noEmit)
-        run: npm run type-check
-
-      # ── Production build ─────────────────────────────────────────────────────
-      - name: Build Next.js application
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run type-check
+      - run: npm test
+      - run: npm run build
         env:
-          # Provide a dummy contract ID so the build doesn't fail on missing env.
-          NEXT_PUBLIC_ANCHORSWAP_CONTRACT: CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM
-          NEXT_PUBLIC_CONTRACT_ID: CAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAD2KM
-        run: npm run build
+          NEXT_TELEMETRY_DISABLED: 1
 
-      # ── Optional: upload build artefact for inspection ───────────────────────
-      - name: Upload build output
-        if: success()
-        uses: actions/upload-artifact@v4
+  # Real Stellar Testnet, run by hand from the Actions tab (it depends on
+  # Friendbot and public testnet services being up).
+  testnet-e2e:
+    name: Testnet end-to-end
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
-          name: nextjs-build
-          path: frontend/.next
-          retention-days: 3
+          node-version: 22
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm run test:testnet
